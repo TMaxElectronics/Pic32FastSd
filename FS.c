@@ -137,3 +137,7 @@ uint8_t FS_dirUp(char * path){
     
     return 1;
 }
+
+inline unsigned FS_isCardPresent(){
+    return 0;
+}
