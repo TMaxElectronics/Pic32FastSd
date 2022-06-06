@@ -28,6 +28,8 @@
 #include "diskio.h"
 #include "SPI.h"
 #include "FreeRTOS.h"
+#include "System.h"
+#include "ff.h"
 
 /* Definitions for MMC/SDC command */
 #define CMD0   (0)			/* GO_IDLE_STATE */
@@ -52,12 +54,12 @@
 
 /* Port Controls  (Platform dependent) */
 #define CS_SETOUT()// TRISHbits.TRISH12 = 0 
-#define CS_LOW()  LATBCLR = _LATB_LATB4_MASK	//MMC CS = L
-#define CS_HIGH() LATBSET = _LATB_LATB4_MASK	//MMC CS = H
+#define CS_LOW()  LATBCLR = _LATB_LATB2_MASK	//MMC CS = L
+#define CS_HIGH() LATBSET = _LATB_LATB2_MASK	//MMC CS = H
 //Change the SPI port number as needed on the following 5 lines
 
 #define	FCLK_SLOW()	SPI_setCLKFreq(SD_spiHandle, 400000)		/* Set slow clock (100k-400k) */
-#define	FCLK_FAST()	SPI_setCLKFreq(SD_spiHandle, 24000000)		/* Set fast clock (depends on the CSD) */
+#define	FCLK_FAST()	SPI_setCLKFreq(SD_spiHandle, 100000000)		/* Set fast clock (depends on the CSD) */
 
 
 static volatile DSTATUS Stat = STA_NOINIT;	/* Disk status */
@@ -235,24 +237,146 @@ static void power_off(void){
 }
 
 /*-----------------------------------------------------------------------*/
+/* Receive a data packet from MMC rather quickly                         */
+/*-----------------------------------------------------------------------*/
+
+#define FRS_WAIT_TOKEN  0
+#define FRS_WAIT_READ   1
+#define FRS_WAIT_SKIP   2
+#define FRS_RETURN_ERROR   0xff
+#define FRS_RETURN_OK   0xfe
+
+typedef struct{
+    uint32_t state;
+    uint32_t bytesLeft;
+    uint32_t currStartByte;
+    uint8_t * garbageBin;
+    uint8_t * buffer;
+    SPI_HANDLE * spiHandle;
+    SemaphoreHandle_t semaphore;
+} rcvr_ISRDATA;
+
+static void rcvr_fastReadDMAISR(uint32_t evt, void * data){
+    rcvr_ISRDATA * d = (rcvr_ISRDATA *) data;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    
+    if(evt & _DCH0INT_CHERIF_MASK){
+        //error!
+        d->state = FRS_RETURN_ERROR;
+        xSemaphoreGiveFromISR(d->semaphore, &xHigherPriorityTaskWoken);
+    }
+    
+    //TODO disable enhanced buffer for pattern match
+    switch(d->state){
+            
+        case FRS_WAIT_READ:     //we just got the data -> check if we need any more
+            rcvr_spi();
+            rcvr_spi(); //skip crc TODO calculate crc with dma
+            d->bytesLeft -= (512 - d->currStartByte);
+            d->buffer += (512 - d->currStartByte);
+            d->currStartByte = 0;
+
+            if(d->bytesLeft == 0){
+                d->state = FRS_RETURN_OK;
+                xSemaphoreGiveFromISR(d->semaphore, &xHigherPriorityTaskWoken);
+            }else{
+                //start next read
+                uint32_t count = 512; uint8_t token = 0xff;
+                while(((token = rcvr_spi()) == 0xFF) && --count);
+                if(token == 0xfe){
+                    if(d->bytesLeft >= 512){
+                        SPI_continueDMARead(d->spiHandle, d->buffer, 512, 1, 1);
+                    }else{
+                        d->state = FRS_WAIT_SKIP;
+                        SPI_continueDMARead(d->spiHandle, d->buffer, d->bytesLeft, 1, 1);
+                    }
+                }else{ //error?
+                    d->state = FRS_RETURN_ERROR;
+                    xSemaphoreGiveFromISR(d->semaphore, &xHigherPriorityTaskWoken);
+                }
+            }
+            return;
+            
+        case FRS_WAIT_SKIP:     //we just got the data to skip -> continue with normal data
+            if(d->currStartByte != 0){    //we are skipping from the beginning -> just continue with normal read
+                SPI_continueDMARead(d->spiHandle, d->buffer, 512 - d->currStartByte, 1, 1);
+                d->state = FRS_WAIT_READ;
+            }else{ //we received tailing skip data -> read crc and go back to task
+                SPI_continueDMARead(d->spiHandle, d->buffer, 512 - d->bytesLeft, 1, 1);
+                d->currStartByte = 512 - d->bytesLeft;
+                d->state = FRS_WAIT_READ;
+            }
+            return;
+    }
+}
+
+static int rcvr_datablockFast (BYTE *buff, UINT startOffset, UINT btr){
+    rcvr_ISRDATA * isrData = pvPortMalloc(sizeof(rcvr_ISRDATA));
+    isrData->buffer = buff;
+    isrData->bytesLeft = btr;
+    isrData->spiHandle = SD_spiHandle;
+    isrData->semaphore = SD_spiHandle->semaphore;
+    isrData->currStartByte = startOffset;
+    
+    uint32_t garbageDataSize = startOffset;
+    if(garbageDataSize < (512 - startOffset)) garbageDataSize = (512 - startOffset);
+    isrData->garbageBin = pvPortMalloc(garbageDataSize);
+    
+    SPI_setDMAEnabled(SD_spiHandle, 1);
+    
+	BYTE token;
+    
+	Timer1 = 100;
+	do {							/* Wait for data packet in timeout of 100ms */
+		token = rcvr_spi();
+	} while ((token == 0xFF) && Timer1);
+
+	if(token != 0xFE){ 
+        xSemaphoreGive(SD_spiHandle->semaphore);
+        return 0;		/* If not valid data token, return with error */
+    }
+    
+    //token received correctly -> card is ready to give us the d(ata) kekW
+    if(startOffset == 0){   //any offset?
+        //no -> start normal read
+        isrData->state = FRS_WAIT_READ;
+        SPI_sendBytes(SD_spiHandle, buff, 512, 1, 1, rcvr_fastReadDMAISR, isrData);
+        
+    }else{
+        //yes -> start offset read
+        isrData->state = FRS_WAIT_SKIP;
+        SPI_sendBytes(SD_spiHandle, isrData->garbageBin, startOffset, 1, 1, rcvr_fastReadDMAISR, isrData);
+    }
+    
+    uint32_t ret = btr;
+    if(!xSemaphoreTake(SD_spiHandle->semaphore, 1000)) ret = 0;
+    
+    if(isrData->state != FRS_RETURN_OK) ret = btr - isrData->bytesLeft;
+    
+    vPortFree(isrData->garbageBin);
+    vPortFree(isrData);
+    SPI_setDMAEnabled(SD_spiHandle, 0);
+
+	return ret;
+}
+
+/*-----------------------------------------------------------------------*/
 /* Receive a data packet from MMC                                        */
 /*-----------------------------------------------------------------------*/
 static int rcvr_datablock (BYTE *buff, UINT btr){
 	BYTE token;
-
+    
 	Timer1 = 100;
 	do {							/* Wait for data packet in timeout of 100ms */
 		token = rcvr_spi();
 	} while ((token == 0xFF) && Timer1);
 
 	if(token != 0xFE) return 0;		/* If not valid data token, retutn with error */
-
-	do {							/* Receive the data block into buffer */
-		rcvr_spi_m(buff++);
-		rcvr_spi_m(buff++);
-		rcvr_spi_m(buff++);
-		rcvr_spi_m(buff++);
-	} while (btr -= 4);
+    
+    //SPI_setDMAEnabled(SD_spiHandle, 1);
+    SPI_sendBytes(SD_spiHandle, buff, btr, 1, 1, NULL, NULL);
+    //SPI_setDMAEnabled(SD_spiHandle, 0);
+    
 	rcvr_spi();						/* Discard CRC */
 	rcvr_spi();
 
@@ -270,7 +394,7 @@ DSTATUS disk_initialize (BYTE drv){
 	power_on();							/* Force socket power on */
     FCLK_SLOW();
 	for (n = 80; n; n--) rcvr_spi();	/* 80 dummy clocks */
-
+    
 	ty = 0;
 	if (send_cmd(CMD0, 0) == 1) {			/* Enter Idle state */
 		Timer1 = 100;						/* Initialization timeout of 1000 msec */
@@ -319,6 +443,65 @@ DSTATUS disk_status (BYTE drv){
 }
 
 
+DRESULT disk_readList (BYTE pdrv, BYTE* buff, DLLObject * list){
+    if(!xSemaphoreTake(SD_spiHandle->semaphore, 1000)) return RES_ERROR;
+    
+    if (pdrv) return RES_PARERR;
+	if (Stat & STA_NOINIT) return RES_NOTRDY;
+
+    ff_readListData_t * currObj = NULL;
+    FRESULT result = FR_OK;
+    
+    while((currObj = DLL_pop(list))){
+        //get address to start reading at
+        uint32_t startSectorAdress = currObj->startSector;
+        if (!(CardType & CT_BLOCK)) startSectorAdress *= 512;	/* Convert to byte address if needed */
+        
+        uint32_t sectorsToRead = currObj->bytesToRead / 512; //TODO dynamic sector sizes!
+        
+        if(sectorsToRead <= 1){
+            if ((send_cmd(CMD17, startSectorAdress) == 0)){
+                if(!rcvr_datablockFast(buff, currObj->startByte, currObj->bytesToRead)){ 
+                    result = FR_DISK_ERR;
+                    break;
+                }
+            }else{
+                result = FR_DISK_ERR;
+                break;
+            }
+        }else{
+            if (send_cmd(CMD18, startSectorAdress) == 0) {	/* READ_MULTIPLE_BLOCK */
+                uint32_t success = rcvr_datablockFast(buff, currObj->startByte, currObj->bytesToRead);
+                send_cmd(CMD12, 0);				/* STOP_TRANSMISSION */
+                if (!success){ 
+                    result = FR_DISK_ERR;
+                    break;
+                }
+            }
+        }
+        vPortFree(currObj);
+        currObj = NULL;
+    }
+    
+    //free incase we broke out of the loop, won't do anything if NULL 
+    vPortFree(currObj);
+    
+	deselect();
+    
+    uint32_t count = DLL_length(list);
+    
+    //empty list if anything remains
+    while((currObj = DLL_pop(list))){
+        vPortFree(currObj);
+        currObj = NULL;
+    }
+    
+    DLL_free(list);
+    
+    xSemaphoreGive(SD_spiHandle->semaphore);
+
+	return count ? RES_ERROR : result;
+}
 
 /*-----------------------------------------------------------------------*/
 /* Read Sector(s)                                                        */

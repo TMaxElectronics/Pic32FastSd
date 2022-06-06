@@ -7,12 +7,19 @@
 #include "FS.h"
 #include "diskio.h"
 #include "ff.h"
+#include "TTerm.h"
 
 //#define DEBUG
 
+static SPI_HANDLE * heil;
+static uint8_t FS_testCommand(TERMINAL_HANDLE * handle, uint8_t argCount, char ** args);
+
 void FS_task(void * params){
-    SPI_HANDLE * handle = (SPI_HANDLE *) handle;
+    SPI_HANDLE * handle = (SPI_HANDLE *) params;
+    heil = handle;
     disk_setSPIHandle(handle);
+    
+    TERM_addCommand(FS_testCommand, "testFS", "tests fs shit fuck cunt", 0, &TERM_defaultList);
     
     //FATFS fso;
     FATFS * fso = pvPortMalloc(sizeof(FATFS));
@@ -27,11 +34,11 @@ void FS_task(void * params){
             if(SDState){        //sd card was just connected
                 vTaskDelay(50);
 #ifdef FS_SD_EVENT_HANDLER
-				FS_SD_EVENT_HANDLER(FS_SD_CONNECTED);
+				FS_SD_EVENT_HANDLER(FS_CARD_CONNECTED);
 #endif
             }else{              //sd card was just removed
 #ifdef FS_SD_EVENT_HANDLER
-				FS_SD_EVENT_HANDLER(FS_SD_DISCONNECTED);
+				FS_SD_EVENT_HANDLER(FS_CARD_DISCONNECTED);
 #endif
                 SDintialized = 0;
                 f_mount(NULL, "", 0);
@@ -44,17 +51,48 @@ void FS_task(void * params){
                 f_mount(fso, "", 0);
                 f_chdir("/");
 #ifdef FS_SD_EVENT_HANDLER
-				FS_SD_EVENT_HANDLER(FS_SD_INIT_SUCCESSFUL);
+				FS_SD_EVENT_HANDLER(FS_CARD_INIT_SUCCESSFUL);
 #endif
             }else{
 #ifdef FS_SD_EVENT_HANDLER
-				FS_SD_EVENT_HANDLER(FS_SD_INIT_FAILED);
+				FS_SD_EVENT_HANDLER(FS_CARD_INIT_FAILED);
 #endif
             }
         }
         
         vTaskDelay(50/portTICK_PERIOD_MS);
     }
+}
+
+static uint8_t FS_testCommand(TERMINAL_HANDLE * handle, uint8_t argCount, char ** args){
+    uint8_t currArg = 0;
+    uint8_t returnCode = 0;
+    for(;currArg<argCount; currArg++){
+        if(strcmp(args[currArg], "-?") == 0){
+            ttprintf("This function is intended for shit\r\n");
+            ttprintf("usage:\r\n\tfuck");
+            return TERM_CMD_EXIT_SUCCESS;
+        }
+    }
+    
+    volatile uint8_t * data = pvPortMalloc(512);
+    data = SYS_makeCoherent(data);
+    for(uint32_t i = 0; i < 512; i++) data[i] = i;
+    for(uint32_t i = 0; i < 512; i++) data[i] = i;
+    for(uint32_t i = 0; i < 512; i++) data[i] = i;
+    for(uint32_t i = 0; i < 512; i++) data[i] = i;
+    
+    
+    SPI_setDMAEnabled(heil, 1);
+    SPI_sendBytes(heil, data, 512, 1, 0, NULL, NULL);
+    SPI_setDMAEnabled(heil, 0);
+
+    for(uint32_t i = 0; i < 512; i++){
+        ttprintf("%03d=0x%02x\r\n", i, data[i]);
+    }
+    
+    data = SYS_makeNonCoherent(data);
+    vPortFree(data);
 }
 
 char * FS_newCWD(char * oldPath, char * newPath){
@@ -139,5 +177,5 @@ uint8_t FS_dirUp(char * path){
 }
 
 inline unsigned FS_isCardPresent(){
-    return 0;
+    return !PORTBbits.RB0;
 }

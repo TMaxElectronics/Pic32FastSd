@@ -1,5 +1,6 @@
 #include <xc.h>
 #include <stdint.h>
+#include "SerialComms.h"
 
 void FS_task(void * params);
 extern inline unsigned FS_isCardPresent();
