@@ -2,97 +2,203 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/attribs.h>
 #include "FreeRTOS.h"
 #include "SPI.h"
 #include "FS.h"
 #include "diskio.h"
 #include "ff.h"
 #include "TTerm.h"
+#include "diskioConfig.h"
+#include "System.h"
 
 //#define DEBUG
 
-static SPI_HANDLE * heil;
+typedef enum {SD_NOT_PRESENT, SD_LOW_POWER, SD_READY, SD_ERROR} FSState_t;
+typedef enum {FSCMD_TIMEOUT = 0, FSCMD_SD_ACCESSED, FSCMD_GO_LP, FSCMD_IOEVT} FSCMD_t;
+
 static uint8_t FS_testCommand(TERMINAL_HANDLE * handle, uint8_t argCount, char ** args);
 
-void FS_task(void * params){
-    SPI_HANDLE * handle = (SPI_HANDLE *) params;
-    heil = handle;
-    disk_setSPIHandle(handle);
+QueueHandle_t sdQueue; //TODO init
+static volatile FSState_t currState = SD_NOT_PRESENT;
+static void FS_task(void * params);
     
-    TERM_addCommand(FS_testCommand, "testFS", "tests fs shit fuck cunt", 0, &TERM_defaultList);
+
+static void goLowPower(SPI_HANDLE * handle){
+    //power down spi module
+    TERM_printDebug(TERM_handle, "Powering down sd card\r\n");
+    handle->CON->ON = 0;
+    TRISBSET = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB15_MASK;
+    
+    //power down sd card and drop vdd to 2.3V
+    LATACLR = _LATA_LATA2_MASK;
+    
+    //delay until sd card power is ready. This MUST be blocking to not return to the sd comms code
+    //SYS_waitCP0(1);
+}
+
+static void goHighPower(SPI_HANDLE * handle){
+    //power down spi module
+    TERM_printDebug(TERM_handle, "Powering up sd card\r\n");
+    handle->CON->ON = 1;
+    TRISBCLR = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB15_MASK;
+    
+    //power down sd card and drop vdd to 2.3V
+    LATASET = _LATA_LATA2_MASK;
+    
+    //delay until sd card power is ready. This MUST be blocking to not return to the sd comms code
+    //SYS_waitCP0(1);
+}
+
+static uint32_t initSD(SPI_HANDLE * handle){
+    //try to init the card a couple of times
+    for(uint32_t attemptCounter = 0; attemptCounter < 5; attemptCounter++){
+        if(disk_initialize(0) == 0){
+            //init successful, return
+            TERM_printDebug(TERM_handle, "SD Card initialised\r\n");
+            return 1;
+        }
+        //init failed... cycle sd card power and try again
+        goLowPower(handle);
+        goHighPower(handle);
+    }
+    //init failed 5 times, give up and return
+    TERM_printDebug(TERM_handle, "SD Card init failed\r\n");
+    return 0;
+}
+
+void __ISR(_CHANGE_NOTICE_VECTOR) FS_cnISR(){
+    //clear flag
+    uint32_t trash = PORTA;
+    IFS1CLR = _IFS1_CNAIF_MASK;
+    
+    //disable cn, this is to prevent contact bouncing overloading the cpu with interrupts
+    IEC1CLR = _IEC1_CNAIE_MASK;
+    
+    //send cmd to fs task queue
+    FSCMD_t cmd = FSCMD_IOEVT;
+    xQueueSendFromISR(sdQueue, &cmd, 0);
+}
+
+uint32_t FS_clearPowerTimeout(){
+    uint32_t csState = LATB & _LATB_LATB10_MASK;
+    
+    FSCMD_t cmd = FSCMD_SD_ACCESSED;
+    xQueueSend(sdQueue, &cmd, 0);
+    
+    LATB &= ~_LATB_LATB10_MASK;
+    LATB |= csState;
+    
+    return currState == SD_READY;
+}
+
+void FS_init(){
+    sdQueue = xQueueCreate(2, sizeof(FSCMD_t));
+    
+    //sd card cs
+    LATBSET = _LATB_LATB10_MASK;
+    //TRISBCLR = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB15_MASK;
+    
+    SPI_HANDLE * spiHandle = SPI_createHandle(2);
+    SPI_init(spiHandle, &RPB11R, 0b0011, 0, 400000);
+    
+    //init change notice
+    CNCONA = _CNCONA_ON_MASK;
+    CNPUASET = _CNPUA_CNPUA0_MASK;
+    CNENASET = _CNENA_CNIEA0_MASK;
+    
+    IPC8bits.CNIP = 3;
+    IEC1SET = _IEC1_CNAIE_MASK;
+    
+    xTaskCreate(FS_task, "fs Task", configMINIMAL_STACK_SIZE + 400, spiHandle, tskIDLE_PRIORITY + 4, NULL);
+    
+    FSCMD_t cmd = FSCMD_IOEVT;
+    if(FS_isCardPresent()) xQueueSend(sdQueue, &cmd, 0);
+}
+
+static void FS_task(void * params){
+    SPI_HANDLE * handle = (SPI_HANDLE *) params;
+    disk_setSPIHandle(handle);
     
     //FATFS fso;
     FATFS * fso = pvPortMalloc(sizeof(FATFS));
     
-    unsigned SDState = 0;
-    unsigned SDintialized = 0;
+    FSCMD_t currCMD;
     
     while(1){
-        unsigned currState = FS_isCardPresent();
-        if(currState != SDState){
-            SDState = currState;
-            if(SDState){        //sd card was just connected
-                vTaskDelay(50);
-#ifdef FS_SD_EVENT_HANDLER
-				FS_SD_EVENT_HANDLER(FS_CARD_CONNECTED);
-#endif
-            }else{              //sd card was just removed
-#ifdef FS_SD_EVENT_HANDLER
-				FS_SD_EVENT_HANDLER(FS_CARD_DISCONNECTED);
-#endif
-                SDintialized = 0;
-                f_mount(NULL, "", 0);
-            }
-        }
+        //wait until we get notified of an event
+        //Timeout depends on the state the machine is in, if the card is powered up we need to have a timeout
+        if(!xQueueReceive(sdQueue, &currCMD, (currState == SD_READY) ? FS_SD_ACCESS_TIMEOUT : portMAX_DELAY)) currCMD = FSCMD_TIMEOUT; //peek timed out => set error flag
         
-        if(SDState && !SDintialized){
-            if(disk_initialize(0) == 0){
-                SDintialized = 1;
-                f_mount(fso, "", 0);
-                f_chdir("/");
-#ifdef FS_SD_EVENT_HANDLER
-				FS_SD_EVENT_HANDLER(FS_CARD_INIT_SUCCESSFUL);
-#endif
+        //now process the event
+        
+        //first of all check for sd card presence
+        if(FS_isCardPresent()){
+            //sd card is present, was it during the last cycle?
+            if(currState == SD_NOT_PRESENT){
+                //nope, we need to init it
+                goHighPower(handle);
+                
+                if(initSD(handle)){
+                    //init successful
+                    
+                    //mount card
+                    f_mount(fso, "", 0);
+                    f_chdir("/");
+                    
+                    //now check what the command was
+                    if(currCMD != FSCMD_SD_ACCESSED){
+                        //cmd was NOT an access request => go to sleep again
+                        goLowPower(handle);
+                        currState = SD_LOW_POWER;
+                    }else{
+                        //cmd was an access request, don't go low power and just switch state
+                        currState = SD_READY;
+                    }
+                }else{
+                    //init failed :(
+                    goLowPower(handle);
+                    currState = SD_ERROR;
+                }
+                
             }else{
-#ifdef FS_SD_EVENT_HANDLER
-				FS_SD_EVENT_HANDLER(FS_CARD_INIT_FAILED);
-#endif
+                //yes, present and initialised. Now check if its asleep
+                if(currState == SD_LOW_POWER){
+                    //wakeup the card an init it if the command is an access request
+                    if(currCMD == FSCMD_SD_ACCESSED){
+                        goHighPower(handle);
+
+                        if(initSD(handle)){
+                            //success :)
+                            currState = SD_READY;
+                        }else{
+                            //failed  :(
+                            goLowPower(handle);
+                            currState = SD_ERROR;
+                        }
+                    }
+                }else{
+                    //sd card is present and powered up, check if we got a cmd to sleep or a timeout occurred. Otherwise just go back to the timeout
+                    if(currCMD == FSCMD_GO_LP || currCMD == FSCMD_TIMEOUT){
+                        //go back to low power mode
+                        goLowPower(handle);
+                        currState = SD_LOW_POWER;
+                    }
+                }
             }
+        }else{
+            //no card present, do we need to de-init anything?
+            if(currState != SD_NOT_PRESENT){
+                //yes, do so
+                goLowPower(handle);
+                f_mount(NULL, "", 0);
+                currState = SD_NOT_PRESENT;
+            }else; //nope, statemachine is already in the correct state
         }
         
-        vTaskDelay(50/portTICK_PERIOD_MS);
+        //re-enable cn in case it was disabled
+        IEC1SET = _IEC1_CNAIE_MASK;
     }
-}
-
-static uint8_t FS_testCommand(TERMINAL_HANDLE * handle, uint8_t argCount, char ** args){
-    uint8_t currArg = 0;
-    uint8_t returnCode = 0;
-    for(;currArg<argCount; currArg++){
-        if(strcmp(args[currArg], "-?") == 0){
-            ttprintf("This function is intended for shit\r\n");
-            ttprintf("usage:\r\n\tfuck");
-            return TERM_CMD_EXIT_SUCCESS;
-        }
-    }
-    
-    volatile uint8_t * data = pvPortMalloc(512);
-    data = SYS_makeCoherent(data);
-    for(uint32_t i = 0; i < 512; i++) data[i] = i;
-    for(uint32_t i = 0; i < 512; i++) data[i] = i;
-    for(uint32_t i = 0; i < 512; i++) data[i] = i;
-    for(uint32_t i = 0; i < 512; i++) data[i] = i;
-    
-    
-    SPI_setDMAEnabled(heil, 1);
-    SPI_sendBytes(heil, data, 512, 1, 0, NULL, NULL);
-    SPI_setDMAEnabled(heil, 0);
-
-    for(uint32_t i = 0; i < 512; i++){
-        ttprintf("%03d=0x%02x\r\n", i, data[i]);
-    }
-    
-    data = SYS_makeNonCoherent(data);
-    vPortFree(data);
 }
 
 char * FS_newCWD(char * oldPath, char * newPath){
@@ -174,8 +280,4 @@ uint8_t FS_dirUp(char * path){
     path[currPos+1] = 0;
     
     return 1;
-}
-
-inline unsigned FS_isCardPresent(){
-    return !PORTBbits.RB0;
 }

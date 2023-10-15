@@ -1,8 +1,7 @@
 #include <xc.h>
 #include <stdint.h>
-#include "SerialComms.h"
 
-void FS_task(void * params);
-extern inline unsigned FS_isCardPresent();
+void FS_init();
 uint8_t FS_dirUp(char * path);
 char * FS_newCWD(char * oldPath, char * newPath);
+uint32_t FS_clearPowerTimeout();

@@ -30,6 +30,8 @@
 #include "FreeRTOS.h"
 #include "System.h"
 #include "ff.h"
+#include "diskioConfig.h"
+#include "FS.h"
 
 /* Definitions for MMC/SDC command */
 #define CMD0   (0)			/* GO_IDLE_STATE */
@@ -52,16 +54,6 @@
 #define CMD58  (58)			/* READ_OCR */
 
 
-/* Port Controls  (Platform dependent) */
-#define CS_SETOUT()// TRISHbits.TRISH12 = 0 
-#define CS_LOW()  LATBCLR = _LATB_LATB2_MASK	//MMC CS = L
-#define CS_HIGH() LATBSET = _LATB_LATB2_MASK	//MMC CS = H
-//Change the SPI port number as needed on the following 5 lines
-
-#define	FCLK_SLOW()	SPI_setCLKFreq(SD_spiHandle, 400000)		/* Set slow clock (100k-400k) */
-#define	FCLK_FAST()	SPI_setCLKFreq(SD_spiHandle, 100000000)		/* Set fast clock (depends on the CSD) */
-
-
 static volatile DSTATUS Stat = STA_NOINIT;	/* Disk status */
 
 static volatile
@@ -82,6 +74,7 @@ SPI_HANDLE * SD_spiHandle;
 /*-----------------------------------------------------------------------*/
 
 static BYTE wait_ready (void){
+    if(!FS_clearPowerTimeout()) return 0xff;
     if(CardType == 0) return 0xff;
 	BYTE res;
     
@@ -91,7 +84,7 @@ static BYTE wait_ready (void){
 	do
 		res = rcvr_spi();
 	while ((res != 0xFF) && ((xTaskGetTickCount() - start) < INIT_TIMEOUT));
-
+    
 	return res;
 }
 
@@ -136,9 +129,8 @@ int select (void)	/* 1:Successful, 0:Timeout */
 /*-----------------------------------------------------------------------*/
 
 static BYTE send_cmd (BYTE cmd, DWORD arg){
-	BYTE n, res;
-
-
+	BYTE n, res, org;
+    org = cmd;
 	if (cmd & 0x80) {	/* ACMD<n> is the command sequense of CMD55-CMD<n> */
 		cmd &= 0x7F;
 		res = send_cmd(CMD55, 0);
@@ -389,6 +381,8 @@ void disk_setSPIHandle(SPI_HANDLE * handle){
 
 DSTATUS disk_initialize (BYTE drv){
 	BYTE n, cmd, ty, ocr[4];
+    
+    FS_clearPowerTimeout();
     
     CardType = 0;
 	power_on();							/* Force socket power on */
