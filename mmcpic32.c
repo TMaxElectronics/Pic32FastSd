@@ -67,7 +67,7 @@ static UINT CardType;
 
 #define INIT_TIMEOUT pdMS_TO_TICKS(100)
 
-SPI_HANDLE * SD_spiHandle;
+SPIHandle_t * SD_spiHandle;
 
 /*-----------------------------------------------------------------------*/
 /* Wait for card ready                                                   */
@@ -244,7 +244,7 @@ typedef struct{
     uint32_t currStartByte;
     uint8_t * garbageBin;
     uint8_t * buffer;
-    SPI_HANDLE * spiHandle;
+    SPIHandle_t * spiHandle;
     SemaphoreHandle_t semaphore;
 } rcvr_ISRDATA;
 
@@ -375,7 +375,7 @@ static int rcvr_datablock (BYTE *buff, UINT btr){
 	return 1;						/* Return with success */
 }
 
-void disk_setSPIHandle(SPI_HANDLE * handle){
+void disk_setSPIHandle(SPIHandle_t * handle){
     SD_spiHandle = handle;
 }
 
@@ -387,6 +387,7 @@ DSTATUS disk_initialize (BYTE drv){
     CardType = 0;
 	power_on();							/* Force socket power on */
     FCLK_SLOW();
+	CS_HIGH();
 	for (n = 80; n; n--) rcvr_spi();	/* 80 dummy clocks */
     
 	ty = 0;

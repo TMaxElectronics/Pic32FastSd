@@ -29,7 +29,7 @@ typedef enum {
 /*---------------------------------------*/
 /* Prototypes for disk control functions */
 
-void    disk_setSPIHandle(SPI_HANDLE * handle);
+void    disk_setSPIHandle(SPIHandle_t * handle);
 DSTATUS disk_initialize (BYTE drv);
 DSTATUS disk_status (BYTE pdrv);
 DRESULT disk_read (BYTE pdrv, BYTE* buff, DWORD sector, UINT count);

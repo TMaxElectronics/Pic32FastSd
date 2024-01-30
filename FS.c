@@ -20,42 +20,40 @@ typedef enum {FSCMD_TIMEOUT = 0, FSCMD_SD_ACCESSED, FSCMD_GO_LP, FSCMD_IOEVT} FS
 static uint8_t FS_testCommand(TERMINAL_HANDLE * handle, uint8_t argCount, char ** args);
 
 QueueHandle_t sdQueue; //TODO init
+SemaphoreHandle_t sdCMD; //TODO init
 static volatile FSState_t currState = SD_NOT_PRESENT;
 static void FS_task(void * params);
     
 
-static void goLowPower(SPI_HANDLE * handle){
+static void goLowPower(SPIHandle_t * handle){
     //power down spi module
-    TERM_printDebug(TERM_handle, "Powering down sd card\r\n");
     handle->CON->ON = 0;
-    TRISBSET = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB15_MASK;
+    TRISBSET = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB13_MASK;
     
     //power down sd card and drop vdd to 2.3V
-    LATACLR = _LATA_LATA2_MASK;
+    LATBCLR = _LATB_LATB5_MASK;
     
     //delay until sd card power is ready. This MUST be blocking to not return to the sd comms code
     //SYS_waitCP0(1);
 }
 
-static void goHighPower(SPI_HANDLE * handle){
+static void goHighPower(SPIHandle_t * handle){
     //power down spi module
-    TERM_printDebug(TERM_handle, "Powering up sd card\r\n");
     handle->CON->ON = 1;
-    TRISBCLR = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB15_MASK;
+    TRISBCLR = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB13_MASK;
     
     //power down sd card and drop vdd to 2.3V
-    LATASET = _LATA_LATA2_MASK;
+    LATBSET = _LATB_LATB5_MASK;
     
     //delay until sd card power is ready. This MUST be blocking to not return to the sd comms code
     //SYS_waitCP0(1);
 }
 
-static uint32_t initSD(SPI_HANDLE * handle){
+static uint32_t initSD(SPIHandle_t * handle){
     //try to init the card a couple of times
     for(uint32_t attemptCounter = 0; attemptCounter < 5; attemptCounter++){
         if(disk_initialize(0) == 0){
             //init successful, return
-            TERM_printDebug(TERM_handle, "SD Card initialised\r\n");
             return 1;
         }
         //init failed... cycle sd card power and try again
@@ -63,13 +61,13 @@ static uint32_t initSD(SPI_HANDLE * handle){
         goHighPower(handle);
     }
     //init failed 5 times, give up and return
-    TERM_printDebug(TERM_handle, "SD Card init failed\r\n");
+    TERM_printDebug(TERM_handle, "ERROR: SD Card init failed\r\n");
     return 0;
 }
 
 void __ISR(_CHANGE_NOTICE_VECTOR) FS_cnISR(){
     //clear flag
-    uint32_t trash = PORTA;
+    uint32_t trash = PORTB;
     IFS1CLR = _IFS1_CNAIF_MASK;
     
     //disable cn, this is to prevent contact bouncing overloading the cpu with interrupts
@@ -81,43 +79,55 @@ void __ISR(_CHANGE_NOTICE_VECTOR) FS_cnISR(){
 }
 
 uint32_t FS_clearPowerTimeout(){
+    //first try to take the command semaphore
+    /*if(!xSemaphoreTake(sdCMD, 0)){
+        //didn't get it, somebody else is already waiting for an op. Cancel it for now
+        return 0;
+    }*/
+    
     uint32_t csState = LATB & _LATB_LATB10_MASK;
     
     FSCMD_t cmd = FSCMD_SD_ACCESSED;
     xQueueSend(sdQueue, &cmd, 0);
     
-    LATB &= ~_LATB_LATB10_MASK;
-    LATB |= csState;
+    /*if(!xSemaphoreTake(sdCMD, FS_SD_ACCESS_TIMEOUT)){
+        //cmd timed out...
+        return 0;
+    }
+    xSemaphoreGive(sdCMD);
+    */
+    
+    LATBbits.LATB10 = csState;
     
     return currState == SD_READY;
 }
 
-void FS_init(){
+void FS_init(SPIHandle_t * spiHandle){
     sdQueue = xQueueCreate(2, sizeof(FSCMD_t));
+    sdCMD = xSemaphoreCreateBinary();
     
     //sd card cs
     LATBSET = _LATB_LATB10_MASK;
     //TRISBCLR = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB15_MASK;
     
-    SPI_HANDLE * spiHandle = SPI_createHandle(2);
-    SPI_init(spiHandle, &RPB11R, 0b0011, 0, 400000);
+    SPI_setCLKFreq(spiHandle, 400000);
     
     //init change notice
-    CNCONA = _CNCONA_ON_MASK;
-    CNPUASET = _CNPUA_CNPUA0_MASK;
-    CNENASET = _CNENA_CNIEA0_MASK;
+    CNCONB = _CNCONB_ON_MASK;
+    CNPUBSET = _CNPUB_CNPUB9_MASK;
+    CNENBSET = _CNENB_CNIEB9_MASK;
     
     IPC8bits.CNIP = 3;
     IEC1SET = _IEC1_CNAIE_MASK;
     
-    xTaskCreate(FS_task, "fs Task", configMINIMAL_STACK_SIZE + 400, spiHandle, tskIDLE_PRIORITY + 4, NULL);
+    xTaskCreate(FS_task, "fs Task", configMINIMAL_STACK_SIZE + 200, spiHandle, tskIDLE_PRIORITY + 4, NULL);
     
     FSCMD_t cmd = FSCMD_IOEVT;
     if(FS_isCardPresent()) xQueueSend(sdQueue, &cmd, 0);
 }
 
 static void FS_task(void * params){
-    SPI_HANDLE * handle = (SPI_HANDLE *) params;
+    SPIHandle_t * handle = (SPIHandle_t *) params;
     disk_setSPIHandle(handle);
     
     //FATFS fso;
@@ -195,6 +205,8 @@ static void FS_task(void * params){
                 currState = SD_NOT_PRESENT;
             }else; //nope, statemachine is already in the correct state
         }
+        
+        xSemaphoreGive(sdCMD);
         
         //re-enable cn in case it was disabled
         IEC1SET = _IEC1_CNAIE_MASK;
