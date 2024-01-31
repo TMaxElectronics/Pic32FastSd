@@ -57,7 +57,7 @@
 static volatile DSTATUS Stat = STA_NOINIT;	/* Disk status */
 
 static volatile
-UINT Timer1, Timer2;		/* 1000Hz decrement timer */
+uint32_t Timer1, Timer2;		/* 1000Hz decrement timer */
 
 static UINT CardType;
 
@@ -379,7 +379,16 @@ void disk_setSPIHandle(SPIHandle_t * handle){
     SD_spiHandle = handle;
 }
 
+//allows software to tell us that the card was externally shutdown (f.e. powered off) and it needs to be re-initialized
+DSTATUS disk_uninitialize (BYTE drv){
+    //set STA_NOINIT bit
+	power_off();		
+}
+
 DSTATUS disk_initialize (BYTE drv){
+    //check if disk is already initialized
+    if(!(Stat & STA_NOINIT)) return 0;  //already initialized
+    
 	BYTE n, cmd, ty, ocr[4];
     
     FS_clearPowerTimeout();
@@ -389,26 +398,31 @@ DSTATUS disk_initialize (BYTE drv){
     FCLK_SLOW();
 	CS_HIGH();
 	for (n = 80; n; n--) rcvr_spi();	/* 80 dummy clocks */
+                    //TERM_printDebug(TERM_handle, "dummmmmmb clock done\r\n");
     
 	ty = 0;
 	if (send_cmd(CMD0, 0) == 1) {			/* Enter Idle state */
-		Timer1 = 100;						/* Initialization timeout of 1000 msec */
+		Timer1 = 1000;						/* Initialization timeout of 1000 msec */
 		if (send_cmd(CMD8, 0x1AA) == 1) {	/* SDv2? */
+                    //TERM_printDebug(TERM_handle, "SDV2\r\n");
 			for (n = 0; n < 4; n++) ocr[n] = rcvr_spi();			/* Get trailing return value of R7 resp */
 			if (ocr[2] == 0x01 && ocr[3] == 0xAA) {				/* The card can work at vdd range of 2.7-3.6V */
-				while (Timer1 && send_cmd(ACMD41, 0x40000000));	/* Wait for leaving idle state (ACMD41 with HCS bit) */
+				while (--Timer1 && send_cmd(ACMD41, 0x40000000));	/* Wait for leaving idle state (ACMD41 with HCS bit) */
 				if (Timer1 && send_cmd(CMD58, 0) == 0) {			/* Check CCS bit in the OCR */
 					for (n = 0; n < 4; n++) ocr[n] = rcvr_spi();
 					ty = (ocr[0] & 0x40) ? CT_SD2|CT_BLOCK : CT_SD2;	/* SDv2 */
-				}
+				}else{
+                    //TERM_printDebug(TERM_handle, "SD Command Timeout!\r\n");
+                }
 			}
 		} else {							/* SDv1 or MMCv3 */
+                    //TERM_printDebug(TERM_handle, "SDV1\r\n");
 			if (send_cmd(ACMD41, 0) <= 1) 	{
 				ty = CT_SD1; cmd = ACMD41;	/* SDv1 */
 			} else {
 				ty = CT_MMC; cmd = CMD1;	/* MMCv3 */
 			}
-			while (Timer1 && send_cmd(cmd, 0));		/* Wait for leaving idle state */
+			while (--Timer1 && send_cmd(cmd, 0));		/* Wait for leaving idle state */
 			if (!Timer1 || send_cmd(CMD16, 512) != 0)	/* Set read/write block length to 512 */
 				ty = 0;
 		}

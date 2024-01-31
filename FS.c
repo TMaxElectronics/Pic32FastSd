@@ -23,6 +23,7 @@ QueueHandle_t sdQueue; //TODO init
 SemaphoreHandle_t sdCMD; //TODO init
 static volatile FSState_t currState = SD_NOT_PRESENT;
 static void FS_task(void * params);
+static TaskHandle_t FS_taskHandle;
     
 
 static void goLowPower(SPIHandle_t * handle){
@@ -32,46 +33,51 @@ static void goLowPower(SPIHandle_t * handle){
     
     //power down sd card and drop vdd to 2.3V
     LATBCLR = _LATB_LATB5_MASK;
-    
-    //delay until sd card power is ready. This MUST be blocking to not return to the sd comms code
-    //SYS_waitCP0(1);
+    disk_uninitialize(0);
+                        //TERM_printDebug(TERM_handle, "went low power\r\n");
 }
 
 static void goHighPower(SPIHandle_t * handle){
-    //power down spi module
-    handle->CON->ON = 1;
-    TRISBCLR = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB13_MASK;
     
     //power down sd card and drop vdd to 2.3V
     LATBSET = _LATB_LATB5_MASK;
+                        //TERM_printDebug(TERM_handle, "went high power\r\n");
     
     //delay until sd card power is ready. This MUST be blocking to not return to the sd comms code
-    //SYS_waitCP0(1);
+    //SYS_waitCP0(50);
+    
+    //power down spi module
+    handle->CON->ON = 1;
+    TRISBCLR = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB13_MASK;
+    disk_uninitialize(0);
 }
 
 static uint32_t initSD(SPIHandle_t * handle){
     //try to init the card a couple of times
     for(uint32_t attemptCounter = 0; attemptCounter < 5; attemptCounter++){
+        //TERM_printDebug(TERM_handle, "start init attempt %d\r\n", attemptCounter);
         if(disk_initialize(0) == 0){
             //init successful, return
+            //TERM_printDebug(TERM_handle, "veri nais, king in the castle\r\n");
             return 1;
         }
         //init failed... cycle sd card power and try again
-        goLowPower(handle);
-        goHighPower(handle);
+        //goLowPower(handle);
+        //goHighPower(handle);
+        vTaskDelay(100);
     }
     //init failed 5 times, give up and return
-    TERM_printDebug(TERM_handle, "ERROR: SD Card init failed\r\n");
+    //TERM_printDebug(TERM_handle, "ERROR: SD Card init failed\r\n");
     return 0;
 }
 
 void __ISR(_CHANGE_NOTICE_VECTOR) FS_cnISR(){
     //clear flag
     uint32_t trash = PORTB;
-    IFS1CLR = _IFS1_CNAIF_MASK;
+    IFS1CLR = _IFS1_CNBIF_MASK;
     
     //disable cn, this is to prevent contact bouncing overloading the cpu with interrupts
-    IEC1CLR = _IEC1_CNAIE_MASK;
+    IEC1CLR = _IEC1_CNBIE_MASK;
     
     //send cmd to fs task queue
     FSCMD_t cmd = FSCMD_IOEVT;
@@ -79,25 +85,42 @@ void __ISR(_CHANGE_NOTICE_VECTOR) FS_cnISR(){
 }
 
 uint32_t FS_clearPowerTimeout(){
-    //first try to take the command semaphore
-    /*if(!xSemaphoreTake(sdCMD, 0)){
-        //didn't get it, somebody else is already waiting for an op. Cancel it for now
-        return 0;
-    }*/
+    //check if the calling task is the FS_TASK, if so we obviously must not wait for command completion
+    if(xTaskGetCurrentTaskHandle() == FS_taskHandle) return 1;
     
-    uint32_t csState = LATB & _LATB_LATB10_MASK;
-    
-    FSCMD_t cmd = FSCMD_SD_ACCESSED;
-    xQueueSend(sdQueue, &cmd, 0);
-    
-    /*if(!xSemaphoreTake(sdCMD, FS_SD_ACCESS_TIMEOUT)){
-        //cmd timed out...
-        return 0;
-    }
-    xSemaphoreGive(sdCMD);
-    */
-    
-    LATBbits.LATB10 = csState;
+    //is there anything to wait for?
+    if(currState != SD_READY){
+        //yes, card isn't ready yet. Schedule a command and wait for it to be finished
+        //uint32_t csState = LATB & _LATB_LATB10_MASK;
+        
+        //try to take the semaphore
+        if(!xSemaphoreTake(sdCMD, FS_SD_ACCESS_TIMEOUT)){
+            //hmm failed, some other task must be waiting for a command to run too
+            //TERM_printDebug(TERM_handle, "fs command que timeout!!!!\r\n");
+            return 0;
+        }
+        
+        //send command
+        FSCMD_t cmd = FSCMD_SD_ACCESSED;
+        xQueueSend(sdQueue, &cmd, 0);
+            //TERM_printDebug(TERM_handle, "fs command queued\r\n");
+
+        //now try to take the semaphore again, this will only work once the command ran and fs_task returned it
+        if(!xSemaphoreTake(sdCMD, FS_SD_ACCESS_TIMEOUT)){
+            //cmd timed out...
+            //TERM_printDebug(TERM_handle, "fs command timeout!!!!\r\n");
+            return 0;
+        }
+        //now return the semaphore
+        xSemaphoreGive(sdCMD);
+
+        //LATBbits.LATB10 = csState;
+    }else{
+        //no, just renew the timeout
+        
+        FSCMD_t cmd = FSCMD_SD_ACCESSED;
+        xQueueSend(sdQueue, &cmd, 0);
+    }   
     
     return currState == SD_READY;
 }
@@ -118,9 +141,9 @@ void FS_init(SPIHandle_t * spiHandle){
     CNENBSET = _CNENB_CNIEB9_MASK;
     
     IPC8bits.CNIP = 3;
-    IEC1SET = _IEC1_CNAIE_MASK;
+    IEC1SET = _IEC1_CNBIE_MASK;
     
-    xTaskCreate(FS_task, "fs Task", configMINIMAL_STACK_SIZE + 200, spiHandle, tskIDLE_PRIORITY + 4, NULL);
+    xTaskCreate(FS_task, "fs Task", configMINIMAL_STACK_SIZE + 200, spiHandle, tskIDLE_PRIORITY + 4, &FS_taskHandle);
     
     FSCMD_t cmd = FSCMD_IOEVT;
     if(FS_isCardPresent()) xQueueSend(sdQueue, &cmd, 0);
@@ -138,78 +161,80 @@ static void FS_task(void * params){
     while(1){
         //wait until we get notified of an event
         //Timeout depends on the state the machine is in, if the card is powered up we need to have a timeout
-        if(!xQueueReceive(sdQueue, &currCMD, (currState == SD_READY) ? FS_SD_ACCESS_TIMEOUT : portMAX_DELAY)) currCMD = FSCMD_TIMEOUT; //peek timed out => set error flag
+        if(!xQueueReceive(sdQueue, &currCMD, (currState == SD_READY || currState == SD_ERROR) ? FS_SD_ACCESS_TIMEOUT : portMAX_DELAY)) currCMD = FSCMD_TIMEOUT; //peek timed out => set error flag
         
         //now process the event
+        //TERM_printDebug(TERM_handle, "event occured! id=%d\r\n", currCMD);
         
-        //first of all check for sd card presence
-        if(FS_isCardPresent()){
-            //sd card is present, was it during the last cycle?
-            if(currState == SD_NOT_PRESENT){
-                //nope, we need to init it
+        //check which event was received
+        if(currCMD == FSCMD_IOEVT){
+            //sd card was just connected or removed
+            
+            //wait a bit for debounce
+            vTaskDelay(10);
+            
+            //was it connected or disconnected?
+            if(FS_isCardPresent()){
+                //connected
+                TERM_printDebug(TERM_handle, "card was connected\r\n");
+                
+                //does the fs know about it?
+                if(currState == SD_NOT_PRESENT){
+                    //no, mount it (but don't initialize it yet!)
+                    f_mount(fso, "", 0);
+                    currState = SD_LOW_POWER;
+                //TERM_printDebug(TERM_handle, "card was mounted\r\n");
+                }
+            }else{
+                //disconnected
+                TERM_printDebug(TERM_handle, "card was disconnected\r\n");
+                
+                //does the fs know about it?
+                if(currState != SD_NOT_PRESENT){
+                    //no, unmount it
+                    f_mount(NULL, "", 0);
+                    currState = SD_NOT_PRESENT;
+                    goLowPower(handle);
+                //TERM_printDebug(TERM_handle, "card was unmounted\r\n");
+                }
+            }
+            
+        }else if(currCMD == FSCMD_SD_ACCESSED){
+            //card was accessed, check if its ready
+            if(currState == SD_LOW_POWER){
+                        //TERM_printDebug(TERM_handle, "powering up card\r\n");
+                        
+                //card isn't ready, power it up and initialize
                 goHighPower(handle);
                 
                 if(initSD(handle)){
-                    //init successful
-                    
-                    //mount card
-                    f_mount(fso, "", 0);
-                    f_chdir("/");
-                    
-                    //now check what the command was
-                    if(currCMD != FSCMD_SD_ACCESSED){
-                        //cmd was NOT an access request => go to sleep again
-                        goLowPower(handle);
-                        currState = SD_LOW_POWER;
-                    }else{
-                        //cmd was an access request, don't go low power and just switch state
-                        currState = SD_READY;
-                    }
+                    //init succeeded
+                    currState = SD_READY;
+                        //TERM_printDebug(TERM_handle, "succcccccess\r\n");
                 }else{
-                    //init failed :(
+                    //init failed :( power down the card again and set error state
                     goLowPower(handle);
-                    currState = SD_ERROR;
-                }
-                
-            }else{
-                //yes, present and initialised. Now check if its asleep
-                if(currState == SD_LOW_POWER){
-                    //wakeup the card an init it if the command is an access request
-                    if(currCMD == FSCMD_SD_ACCESSED){
-                        goHighPower(handle);
-
-                        if(initSD(handle)){
-                            //success :)
-                            currState = SD_READY;
-                        }else{
-                            //failed  :(
-                            goLowPower(handle);
-                            currState = SD_ERROR;
-                        }
-                    }
-                }else{
-                    //sd card is present and powered up, check if we got a cmd to sleep or a timeout occurred. Otherwise just go back to the timeout
-                    if(currCMD == FSCMD_GO_LP || currCMD == FSCMD_TIMEOUT){
-                        //go back to low power mode
-                        goLowPower(handle);
-                        currState = SD_LOW_POWER;
-                    }
+                    currState = SD_ERROR;   //error state will remain until write timeout occurs
+                    TERM_printDebug(TERM_handle, "sd init failure :( locking out until timeout\r\n");
                 }
             }
-        }else{
-            //no card present, do we need to de-init anything?
-            if(currState != SD_NOT_PRESENT){
-                //yes, do so
+        }else if(currCMD == FSCMD_GO_LP || currCMD == FSCMD_TIMEOUT){
+            //timeout occured or low power command was sent, shutdown card if necessary
+            if(currState == SD_READY){
                 goLowPower(handle);
-                f_mount(NULL, "", 0);
-                currState = SD_NOT_PRESENT;
-            }else; //nope, statemachine is already in the correct state
+                currState = SD_LOW_POWER; 
+            }else if(currState == SD_ERROR){
+                currState = SD_LOW_POWER; 
+                TERM_printDebug(TERM_handle, "sd error time out\r\n");
+            }
+        }else{
+            //TERM_printDebug(TERM_handle, "invalid command received! &d\r\n", currCMD);
         }
         
         xSemaphoreGive(sdCMD);
         
         //re-enable cn in case it was disabled
-        IEC1SET = _IEC1_CNAIE_MASK;
+        IEC1SET = _IEC1_CNBIE_MASK;
     }
 }
 
