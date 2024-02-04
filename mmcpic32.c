@@ -358,12 +358,17 @@ static int rcvr_datablockFast (BYTE *buff, UINT startOffset, UINT btr){
 static int rcvr_datablock (BYTE *buff, UINT btr){
 	BYTE token;
     
-	Timer1 = 100;
-	do {							/* Wait for data packet in timeout of 100ms */
+	for(uint32_t i = 0; i < 100; i++){							/* Wait for data packet in timeout of 100ms */
 		token = rcvr_spi();
-	} while ((token == 0xFF) && Timer1);
+        if(token != 0xff){
+            break;
+        }
+        vTaskDelay(1);
+	}
 
-	if(token != 0xFE) return 0;		/* If not valid data token, retutn with error */
+	if(token != 0xFE){ 
+        return 0;		/* If not valid data token, retutn with error */
+    }
     
     //SPI_setDMAEnabled(SD_spiHandle, 1);
     SPI_sendBytes(SD_spiHandle, buff, btr, 1, 1, NULL, NULL);

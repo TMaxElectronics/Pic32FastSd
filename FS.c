@@ -29,7 +29,7 @@ static TaskHandle_t FS_taskHandle;
 static void goLowPower(SPIHandle_t * handle){
     //power down spi module
     handle->CON->ON = 0;
-    TRISBSET = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB13_MASK;
+    TRISBSET = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB15_MASK;
     
     //power down sd card and drop vdd to 2.3V
     LATBCLR = _LATB_LATB5_MASK;
@@ -44,11 +44,11 @@ static void goHighPower(SPIHandle_t * handle){
                         //TERM_printDebug(TERM_handle, "went high power\r\n");
     
     //delay until sd card power is ready. This MUST be blocking to not return to the sd comms code
-    //SYS_waitCP0(50);
+    SYS_waitCP0(1);
     
     //power down spi module
     handle->CON->ON = 1;
-    TRISBCLR = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB13_MASK;
+    TRISBCLR = _LATB_LATB10_MASK | _LATB_LATB11_MASK | _LATB_LATB15_MASK;
     disk_uninitialize(0);
 }
 
@@ -96,7 +96,7 @@ uint32_t FS_clearPowerTimeout(){
         //try to take the semaphore
         if(!xSemaphoreTake(sdCMD, FS_SD_ACCESS_TIMEOUT)){
             //hmm failed, some other task must be waiting for a command to run too
-            //TERM_printDebug(TERM_handle, "fs command que timeout!!!!\r\n");
+            TERM_printDebug(TERM_handle, "fs command que timeout!\r\n");
             return 0;
         }
         
@@ -108,7 +108,7 @@ uint32_t FS_clearPowerTimeout(){
         //now try to take the semaphore again, this will only work once the command ran and fs_task returned it
         if(!xSemaphoreTake(sdCMD, FS_SD_ACCESS_TIMEOUT)){
             //cmd timed out...
-            //TERM_printDebug(TERM_handle, "fs command timeout!!!!\r\n");
+            TERM_printDebug(TERM_handle, "fs command timeout!!!!\r\n");
             return 0;
         }
         //now return the semaphore
@@ -167,6 +167,7 @@ static void FS_task(void * params){
         //TERM_printDebug(TERM_handle, "event occured! id=%d\r\n", currCMD);
         
         //check which event was received
+
         if(currCMD == FSCMD_IOEVT){
             //sd card was just connected or removed
             
@@ -222,13 +223,14 @@ static void FS_task(void * params){
             //timeout occured or low power command was sent, shutdown card if necessary
             if(currState == SD_READY){
                 goLowPower(handle);
+                        //TERM_printDebug(TERM_handle, "powering down card\r\n");
                 currState = SD_LOW_POWER; 
             }else if(currState == SD_ERROR){
                 currState = SD_LOW_POWER; 
                 TERM_printDebug(TERM_handle, "sd error time out\r\n");
             }
         }else{
-            //TERM_printDebug(TERM_handle, "invalid command received! &d\r\n", currCMD);
+            TERM_printDebug(TERM_handle, "invalid command received! &d\r\n", currCMD);
         }
         
         xSemaphoreGive(sdCMD);
