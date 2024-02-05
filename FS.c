@@ -11,6 +11,7 @@
 #include "TTerm.h"
 #include "diskioConfig.h"
 #include "System.h"
+#include "AccelLogger.h"
 
 //#define DEBUG
 
@@ -44,7 +45,7 @@ static void goHighPower(SPIHandle_t * handle){
                         //TERM_printDebug(TERM_handle, "went high power\r\n");
     
     //delay until sd card power is ready. This MUST be blocking to not return to the sd comms code
-    SYS_waitCP0(1);
+    vTaskDelay(pdMS_TO_TICKS(1));
     
     //power down spi module
     handle->CON->ON = 1;
@@ -172,6 +173,9 @@ static void FS_task(void * params){
                     currState = SD_LOW_POWER;
                 //TERM_printDebug(TERM_handle, "card was mounted\r\n");
                 }
+                
+                //TODO make callbacks dynamic
+                AL_isr(AL_SD_CONNECTED);
             }else{
                 //disconnected
                 TERM_printDebug(TERM_handle, "card was disconnected\r\n");
@@ -184,6 +188,9 @@ static void FS_task(void * params){
                     goLowPower(handle);
                 //TERM_printDebug(TERM_handle, "card was unmounted\r\n");
                 }
+                
+                //TODO make callbacks dynamic
+                AL_isr(AL_SD_DISCONNECTED);
             }
             
         }else if(currCMD == FSCMD_SD_ACCESSED){
