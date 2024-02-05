@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include "SPI.h"
 
+void FS_sdCardIOEvtHandler();
 void FS_init(SPIHandle_t * spiHandle);
 uint8_t FS_dirUp(char * path);
 char * FS_newCWD(char * oldPath, char * newPath);

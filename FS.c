@@ -71,14 +71,7 @@ static uint32_t initSD(SPIHandle_t * handle){
     return 0;
 }
 
-void __ISR(_CHANGE_NOTICE_VECTOR) FS_cnISR(){
-    //clear flag
-    uint32_t trash = PORTB;
-    IFS1CLR = _IFS1_CNBIF_MASK;
-    
-    //disable cn, this is to prevent contact bouncing overloading the cpu with interrupts
-    IEC1CLR = _IEC1_CNBIE_MASK;
-    
+void FS_sdCardIOEvtHandler(){
     //send cmd to fs task queue
     FSCMD_t cmd = FSCMD_IOEVT;
     xQueueSendFromISR(sdQueue, &cmd, 0);
@@ -135,13 +128,6 @@ void FS_init(SPIHandle_t * spiHandle){
     
     SPI_setCLKFreq(spiHandle, 400000);
     
-    //init change notice
-    CNCONB = _CNCONB_ON_MASK;
-    CNPUBSET = _CNPUB_CNPUB9_MASK;
-    CNENBSET = _CNENB_CNIEB9_MASK;
-    
-    IPC8bits.CNIP = 3;
-    IEC1SET = _IEC1_CNBIE_MASK;
     
     xTaskCreate(FS_task, "fs Task", configMINIMAL_STACK_SIZE + 200, spiHandle, tskIDLE_PRIORITY + 4, &FS_taskHandle);
     
